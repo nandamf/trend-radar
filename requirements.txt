@@ -1,0 +1,5 @@
+pytrends
+pandas
+sqlalchemy
+psycopg2-binary
+apache-airflow
