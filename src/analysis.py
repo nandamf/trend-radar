@@ -1,126 +1,171 @@
-import duckdb
-import polars as pl
+from __future__ import annotations
+
 import numpy as np
+import polars as pl
 from sklearn.linear_model import LinearRegression
 
-
-def load_trends():
-
-    con = duckdb.connect("data/trends.duckdb")
-
-    df = con.execute("""
-        SELECT date, keyword, interest
-        FROM trends
-    """).fetch_arrow_table()
-
-    return pl.from_arrow(df)
+from src.data_access import fetch_trends
 
 
-def get_trend_scores():
+def _fit_slope(values: np.ndarray) -> float:
+    x = np.arange(len(values)).reshape(-1, 1)
+    model = LinearRegression().fit(x, values)
+    return float(model.coef_[0])
 
-    df = load_trends()
 
-    results = []
-
-    keywords = df.select("keyword").unique().to_series().to_list()
-
-    for keyword in keywords:
-
-        subset = (
-            df.filter(pl.col("keyword") == keyword)
-            .sort("date")
-            .with_row_count("t")
-        )
-
-        X = subset["t"].to_numpy().reshape(-1, 1)
-        y = subset["interest"].to_numpy()
-
-        model = LinearRegression()
-        model.fit(X, y)
-
-        slope = model.coef_[0]
-
-        results.append({
-            "keyword": keyword,
-            "trend_score": float(slope)
-        })
-
+def _keyword_series(df: pl.DataFrame, keyword: str) -> np.ndarray:
     return (
-        pl.DataFrame(results)
-        .sort("trend_score", descending=True)
+        df.filter(pl.col("keyword") == keyword)
+        .sort("date")["interest"]
+        .to_numpy()
     )
 
 
-def get_top_trends():
-
-    df = load_trends()
-
+def get_top_trends(df: pl.DataFrame | None = None) -> pl.DataFrame:
+    frame = fetch_trends() if df is None else df
     return (
-        df.group_by("keyword")
-        .agg([
+        frame.group_by("keyword")
+        .agg(
             pl.col("interest").min().alias("min_interest"),
-            pl.col("interest").max().alias("max_interest")
-        ])
-        .with_columns(
-            (pl.col("max_interest") - pl.col("min_interest")).alias("growth")
+            pl.col("interest").max().alias("max_interest"),
         )
+        .with_columns((pl.col("max_interest") - pl.col("min_interest")).alias("growth"))
         .sort("growth", descending=True)
         .select(["keyword", "growth"])
     )
 
-def forecast_trends(steps: int = 5):
 
-    df = load_trends()
-
+def forecast_trends(steps: int = 5, df: pl.DataFrame | None = None) -> pl.DataFrame:
+    frame = fetch_trends() if df is None else df
     forecasts = []
-
-    keywords = df.select("keyword").unique().to_series().to_list()
+    keywords = frame.select("keyword").unique().to_series().to_list()
 
     for keyword in keywords:
+        series = _keyword_series(frame, keyword)
+        if len(series) < 2:
+            continue
 
-        subset = (
-            df.filter(pl.col("keyword") == keyword)
-            .sort("date")
-            .with_row_count("t")
+        x = np.arange(len(series)).reshape(-1, 1)
+        model = LinearRegression().fit(x, series)
+
+        future_x = np.arange(len(series), len(series) + steps).reshape(-1, 1)
+        prediction = float(model.predict(future_x)[-1])
+
+        forecasts.append(
+            {
+                "keyword": keyword,
+                "forecast_interest": prediction,
+                "trend_direction": "up" if prediction > float(series[-1]) else "down",
+            }
         )
 
-        X = subset["t"].to_numpy().reshape(-1, 1)
-        y = subset["interest"].to_numpy()
+    if not forecasts:
+        return pl.DataFrame(
+            schema={
+                "keyword": pl.Utf8,
+                "forecast_interest": pl.Float64,
+                "trend_direction": pl.Utf8,
+            }
+        )
+    return pl.DataFrame(forecasts).sort("forecast_interest", descending=True)
 
-        model = LinearRegression()
-        model.fit(X, y)
 
-        last_t = subset["t"].max()
+def momentum_score(df: pl.DataFrame | None = None) -> pl.DataFrame:
+    frame = fetch_trends() if df is None else df
+    trends = get_top_trends(frame)
+    forecast = forecast_trends(df=frame)
+    if trends.is_empty() or forecast.is_empty():
+        return pl.DataFrame(
+            schema={
+                "keyword": pl.Utf8,
+                "growth": pl.Float64,
+                "forecast_interest": pl.Float64,
+                "trend_direction": pl.Utf8,
+                "momentum_score": pl.Float64,
+            }
+        )
+    return (
+        trends.join(forecast, on="keyword")
+        .with_columns(
+            (
+                pl.col("growth") * 0.55
+                + pl.col("forecast_interest") * 0.35
+                + pl.when(pl.col("trend_direction") == "up").then(10).otherwise(-10) * 0.10
+            ).alias("momentum_score")
+        )
+        .sort("momentum_score", descending=True)
+    )
 
-        future_t = np.arange(last_t + 1, last_t + steps + 1).reshape(-1, 1)
 
-        predictions = model.predict(future_t)
+def trend_diagnostics(df: pl.DataFrame | None = None, recent_window: int = 12) -> pl.DataFrame:
+    frame = fetch_trends() if df is None else df
+    if frame.is_empty():
+        return pl.DataFrame(
+            schema={
+                "keyword": pl.Utf8,
+                "avg_interest": pl.Float64,
+                "latest_interest": pl.Float64,
+                "growth": pl.Float64,
+                "volatility": pl.Float64,
+                "long_slope": pl.Float64,
+                "short_slope": pl.Float64,
+                "acceleration": pl.Float64,
+                "forecast_interest": pl.Float64,
+                "reversal_risk": pl.Float64,
+                "strategic_score": pl.Float64,
+            }
+        )
 
-        forecasts.append({
-            "keyword": keyword,
-            "forecast_interest": float(predictions[-1]),
-            "trend_direction": "up"
-            if predictions[-1] > y[-1]
-            else "down"
-        })
+    records = []
+    for keyword in frame.select("keyword").unique().to_series().to_list():
+        series = _keyword_series(frame, keyword)
+        if len(series) < 4:
+            continue
+
+        long_slope = _fit_slope(series)
+        short_tail = series[-min(recent_window, len(series)) :]
+        short_slope = _fit_slope(short_tail)
+        acceleration = short_slope - long_slope
+
+        x = np.arange(len(series)).reshape(-1, 1)
+        model = LinearRegression().fit(x, series)
+        forecast = float(model.predict(np.array([[len(series) + 4]]))[0])
+
+        avg_interest = float(np.mean(series))
+        latest = float(series[-1])
+        growth = float(np.max(series) - np.min(series))
+        volatility = float(np.std(series))
+        downturn = max(0.0, -short_slope)
+        reversal_risk = float((downturn * 0.65) + (volatility * 0.35))
+
+        records.append(
+            {
+                "keyword": keyword,
+                "avg_interest": avg_interest,
+                "latest_interest": latest,
+                "growth": growth,
+                "volatility": volatility,
+                "long_slope": long_slope,
+                "short_slope": short_slope,
+                "acceleration": acceleration,
+                "forecast_interest": forecast,
+                "reversal_risk": reversal_risk,
+            }
+        )
+
+    diagnostics = pl.DataFrame(records)
+    if diagnostics.is_empty():
+        return diagnostics
 
     return (
-        pl.DataFrame(forecasts)
-        .sort("forecast_interest", descending=True)
+        diagnostics.with_columns(
+            (
+                pl.col("avg_interest") * 0.25
+                + pl.col("growth") * 0.20
+                + pl.col("acceleration") * 0.35
+                + (pl.col("forecast_interest") - pl.col("latest_interest")) * 0.20
+                - pl.col("reversal_risk") * 0.15
+            ).alias("strategic_score")
+        )
+        .sort("strategic_score", descending=True)
     )
-
-def momentum_score():
-
-    trends = get_top_trends()
-    forecast = forecast_trends()
-
-    df = trends.join(forecast, on="keyword")
-
-    df = df.with_columns(
-        (
-            pl.col("growth") * 0.6 +
-            pl.col("forecast_interest") * 0.4
-        ).alias("momentum_score")
-    )
-
-    return df.sort("momentum_score", descending=True)

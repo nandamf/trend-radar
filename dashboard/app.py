@@ -1,272 +1,330 @@
+from __future__ import annotations
+
 import sys
-import os
+import threading
+import webbrowser
+from pathlib import Path
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-import streamlit as st
-import duckdb
-import polars as pl
+import dash
+import dash_bootstrap_components as dbc
 import plotly.express as px
-from pyvis.network import Network
+import plotly.graph_objects as go
+import polars as pl
+from dash import Input, Output, dash_table, dcc, html
 
-from src.analysis import get_top_trends, forecast_trends, momentum_score
-from src.trend_graph import build_trend_graph
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
+from src.analysis import forecast_trends, trend_diagnostics
+from src.data_access import fetch_trends
 
 
-# ---------------------------------------------------
-# PAGE CONFIG
-# ---------------------------------------------------
+def _base_dataframe() -> pl.DataFrame:
+    df = fetch_trends()
+    return df.with_columns(pl.col("date").cast(pl.Date))
 
-st.set_page_config(
-    page_title="AI Trend Radar",
-    page_icon="🚀",
-    layout="wide"
+
+DATA = _base_dataframe()
+ALL_KEYWORDS = sorted(DATA["keyword"].unique().to_list())
+
+
+def _empty_figure(title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+        annotations=[{"text": "Sem dados para os filtros selecionados", "showarrow": False}],
+    )
+    return fig
+
+
+def _kpi_card(title: str, value_id: str, subtitle_id: str) -> dbc.Card:
+    return dbc.Card(
+        dbc.CardBody(
+            [
+                html.Div(title, className="kpi-title"),
+                html.H3(id=value_id, className="kpi-value"),
+                html.Small(id=subtitle_id, className="text-muted"),
+            ]
+        ),
+        className="kpi-card",
+    )
+
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY], suppress_callback_exceptions=True)
+app.title = "AI Trend Radar"
+
+app.layout = dbc.Container(
+    [
+        html.Div(
+            [
+                html.H1("AI Trend Radar", className="display-6 fw-bold mb-1"),
+                html.P(
+                    "Painel estratégico com foco em aceleração, tração e risco de reversão.",
+                    className="text-muted mb-0",
+                ),
+            ],
+            className="py-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    [
+                        html.Label("Tecnologias"),
+                        dcc.Dropdown(
+                            id="keyword-filter",
+                            options=[{"label": k.title(), "value": k} for k in ALL_KEYWORDS],
+                            value=ALL_KEYWORDS[: min(6, len(ALL_KEYWORDS))],
+                            multi=True,
+                            placeholder="Selecione tecnologias",
+                        ),
+                    ],
+                    md=8,
+                ),
+                dbc.Col(
+                    [
+                        html.Label("Janela de análise"),
+                        dcc.Dropdown(
+                            id="window-filter",
+                            options=[
+                                {"label": "Curto prazo (12 pontos)", "value": 12},
+                                {"label": "Médio prazo (24 pontos)", "value": 24},
+                                {"label": "Longo prazo (36 pontos)", "value": 36},
+                            ],
+                            value=12,
+                            clearable=False,
+                        ),
+                    ],
+                    md=4,
+                ),
+            ],
+            className="g-3 mb-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(_kpi_card("Lider Estratégico", "kpi-leader", "kpi-leader-sub"), md=3),
+                dbc.Col(_kpi_card("Maior Aceleração", "kpi-accel", "kpi-accel-sub"), md=3),
+                dbc.Col(_kpi_card("Risco Médio", "kpi-risk", "kpi-risk-sub"), md=3),
+                dbc.Col(_kpi_card("Tendências em Alta", "kpi-up", "kpi-up-sub"), md=3),
+            ],
+            className="g-3 mb-4",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(dcc.Graph(id="line-trends", config={"displayModeBar": False}), md=8),
+                dbc.Col(dcc.Graph(id="forecast-bar", config={"displayModeBar": False}), md=4),
+            ],
+            className="g-3 mb-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(dcc.Graph(id="heatmap", config={"displayModeBar": False}), md=6),
+                dbc.Col(dcc.Graph(id="quadrant", config={"displayModeBar": False}), md=6),
+            ],
+            className="g-3 mb-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    dash_table.DataTable(
+                        id="diagnostic-table",
+                        page_size=10,
+                        sort_action="native",
+                        style_as_list_view=True,
+                        style_header={"fontWeight": "bold"},
+                        style_cell={"padding": "10px", "fontFamily": "Segoe UI", "fontSize": 13},
+                        style_data_conditional=[
+                            {
+                                "if": {"filter_query": "{reversal_risk} > 12"},
+                                "backgroundColor": "#fdecea",
+                            },
+                            {
+                                "if": {"filter_query": "{acceleration} > 0"},
+                                "backgroundColor": "#eaf7f0",
+                            },
+                        ],
+                    ),
+                    md=12,
+                )
+            ],
+            className="g-3 mb-4",
+        ),
+    ],
+    fluid=True,
+    style={"maxWidth": "1500px"},
 )
 
-# ---------------------------------------------------
-# CUSTOM STYLE
-# ---------------------------------------------------
 
-st.markdown("""
-<style>
-
-.main {
-    background-color: #0E1117;
-}
-
-.block-container {
-    padding-top: 2rem;
-}
-
-h1, h2, h3 {
-    font-weight: 700;
-}
-
-[data-testid="stMetric"] {
-    background-color: #1E1E2F;
-    border-radius: 12px;
-    padding: 15px;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------------------------------------------
-# HEADER
-# ---------------------------------------------------
-
-st.markdown("""
-# 🚀 AI Technology Trend Radar
-Real-time intelligence on emerging artificial intelligence technologies
-""")
-
-# ---------------------------------------------------
-# SIDEBAR
-# ---------------------------------------------------
-
-st.sidebar.title("AI Trend Radar")
-
-st.sidebar.markdown(
-"""
-Explore emerging technologies and identify which AI topics are gaining momentum.
-"""
+@app.callback(
+    Output("kpi-leader", "children"),
+    Output("kpi-leader-sub", "children"),
+    Output("kpi-accel", "children"),
+    Output("kpi-accel-sub", "children"),
+    Output("kpi-risk", "children"),
+    Output("kpi-risk-sub", "children"),
+    Output("kpi-up", "children"),
+    Output("kpi-up-sub", "children"),
+    Output("line-trends", "figure"),
+    Output("forecast-bar", "figure"),
+    Output("heatmap", "figure"),
+    Output("quadrant", "figure"),
+    Output("diagnostic-table", "columns"),
+    Output("diagnostic-table", "data"),
+    Input("keyword-filter", "value"),
+    Input("window-filter", "value"),
 )
+def update_dashboard(selected_keywords: list[str], window: int):
+    selected_keywords = selected_keywords or ALL_KEYWORDS
+    filtered = DATA.filter(pl.col("keyword").is_in(selected_keywords))
 
-# ---------------------------------------------------
-# LOAD DATA
-# ---------------------------------------------------
+    if filtered.is_empty():
+        empty = _empty_figure("Sem dados")
+        return (
+            "-",
+            "Sem dados",
+            "-",
+            "Sem dados",
+            "-",
+            "Sem dados",
+            "-",
+            "Sem dados",
+            empty,
+            empty,
+            empty,
+            empty,
+            [],
+            [],
+        )
 
-con = duckdb.connect("data/trends.duckdb")
+    diagnostics = trend_diagnostics(filtered, recent_window=int(window))
+    if diagnostics.is_empty():
+        diagnostics = pl.DataFrame(
+            {
+                "keyword": [],
+                "strategic_score": [],
+                "acceleration": [],
+                "reversal_risk": [],
+                "forecast_interest": [],
+            }
+        )
 
-df = pl.from_arrow(
-    con.execute("""
-        SELECT date, keyword, interest
-        FROM trends
-    """).fetch_arrow_table()
-)
+    forecast = forecast_trends(df=filtered).head(10)
+    leader = diagnostics[0, "keyword"] if diagnostics.height else "-"
+    leader_score = diagnostics[0, "strategic_score"] if diagnostics.height else 0
 
-ranking = get_top_trends()
-forecast = forecast_trends()
+    accel_leader = diagnostics.sort("acceleration", descending=True)
+    accel_name = accel_leader[0, "keyword"] if accel_leader.height else "-"
+    accel_value = accel_leader[0, "acceleration"] if accel_leader.height else 0
 
-# ---------------------------------------------------
-# KPI METRICS
-# ---------------------------------------------------
+    risk_avg = diagnostics["reversal_risk"].mean() if diagnostics.height else 0
+    up_count = forecast.filter(pl.col("trend_direction") == "up").height if forecast.height else 0
 
-top_tech = ranking[0, "keyword"]
-top_growth = ranking[0, "growth"]
+    line_df = filtered.to_pandas()
+    fig_line = px.line(
+        line_df,
+        x="date",
+        y="interest",
+        color="keyword",
+        markers=False,
+        template="plotly_white",
+        title="Evolucao temporal de interesse",
+    )
+    fig_line.update_layout(margin={"l": 10, "r": 10, "t": 40, "b": 10}, hovermode="x unified")
 
-forecast_up = forecast.filter(pl.col("trend_direction") == "up").height
-forecast_down = forecast.filter(pl.col("trend_direction") == "down").height
+    if forecast.height:
+        fig_forecast = px.bar(
+            forecast.to_pandas(),
+            y="keyword",
+            x="forecast_interest",
+            color="trend_direction",
+            orientation="h",
+            template="plotly_white",
+            title="Projecao de interesse (top 10)",
+            color_discrete_map={"up": "#1b9e77", "down": "#d95f02"},
+        )
+        fig_forecast.update_layout(margin={"l": 10, "r": 10, "t": 40, "b": 10})
+    else:
+        fig_forecast = _empty_figure("Projecao")
 
-col1, col2, col3, col4 = st.columns(4)
+    heat = (
+        filtered.group_by(["date", "keyword"])
+        .agg(pl.col("interest").mean().alias("interest"))
+        .pivot(index="keyword", on="date", values="interest")
+        .fill_null(0)
+    )
+    heat_pd = heat.to_pandas().set_index("keyword")
+    fig_heat = px.imshow(
+        heat_pd,
+        aspect="auto",
+        color_continuous_scale="Viridis",
+        title="Mapa de calor por tecnologia",
+        template="plotly_white",
+    )
+    fig_heat.update_layout(margin={"l": 10, "r": 10, "t": 40, "b": 10})
 
-col1.metric("🔥 Fastest Growing", top_tech)
-col2.metric("📈 Growth Score", int(top_growth))
-col3.metric("🚀 Rising Trends", forecast_up)
-col4.metric("⚠ Declining Trends", forecast_down)
+    if diagnostics.height:
+        fig_quad = px.scatter(
+            diagnostics.to_pandas(),
+            x="acceleration",
+            y="volatility",
+            size="avg_interest",
+            color="reversal_risk",
+            hover_name="keyword",
+            template="plotly_white",
+            title="Quadrante: aceleracao vs volatilidade",
+            color_continuous_scale="RdYlGn_r",
+        )
+        fig_quad.add_hline(y=float(diagnostics["volatility"].mean()), line_dash="dot", line_color="gray")
+        fig_quad.add_vline(x=0, line_dash="dot", line_color="gray")
+        fig_quad.update_layout(margin={"l": 10, "r": 10, "t": 40, "b": 10})
+    else:
+        fig_quad = _empty_figure("Quadrante")
 
-st.divider()
+    table = (
+        diagnostics.select(
+            [
+                "keyword",
+                "strategic_score",
+                "acceleration",
+                "reversal_risk",
+                "forecast_interest",
+            ]
+        )
+        .with_columns(
+            pl.col("strategic_score").round(2),
+            pl.col("acceleration").round(2),
+            pl.col("reversal_risk").round(2),
+            pl.col("forecast_interest").round(2),
+        )
+    )
+    columns = [{"name": col, "id": col} for col in table.columns]
+    data = table.to_dicts()
 
-# ---------------------------------------------------
-# TREND EVOLUTION
-# ---------------------------------------------------
+    return (
+        leader.title(),
+        f"Strategic score: {leader_score:.2f}",
+        accel_name.title(),
+        f"Aceleracao: {accel_value:.2f}",
+        f"{risk_avg:.2f}",
+        "Indice combinado de downturn + volatilidade",
+        str(up_count),
+        f"de {forecast.height} com sinal de alta",
+        fig_line,
+        fig_forecast,
+        fig_heat,
+        fig_quad,
+        columns,
+        data,
+    )
 
-st.header("📈 Technology Trend Evolution")
 
-st.divider()
-
-st.header("🔥 AI Trend Heatmap")
-
-heat = (
-    df.group_by(["date", "keyword"])
-    .agg(pl.col("interest").mean())
-)
-
-heat_df = heat.to_pandas()
-
-fig_heat = px.density_heatmap(
-    heat_df,
-    x="date",
-    y="keyword",
-    z="interest",
-    color_continuous_scale="Turbo"
-)
-
-fig_heat.update_layout(template="plotly_dark")
-
-st.plotly_chart(fig_heat, use_container_width=True)
-
-keywords = df["keyword"].unique().to_list()
-
-selected = st.multiselect(
-    "Select technologies",
-    options=keywords,
-    default=keywords[:3]
-)
-
-filtered = df.filter(pl.col("keyword").is_in(selected))
-
-fig = px.line(
-    filtered.to_pandas(),
-    x="date",
-    y="interest",
-    color="keyword",
-    markers=True
-)
-
-fig.update_layout(
-    template="plotly_dark",
-    title="AI Technology Interest Over Time",
-    height=450,
-    margin=dict(l=0, r=0, t=40, b=0),
-    hovermode="x unified"
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-st.divider()
-
-# ---------------------------------------------------
-# FORECAST
-# ---------------------------------------------------
-
-st.header("🔮 Trend Forecast")
-
-for row in forecast.head(5).iter_rows():
-
-    keyword, value, direction = row
-
-    arrow = "📈" if direction == "up" else "📉"
-
-    st.write(f"{arrow} **{keyword}** → predicted interest {value:.2f}")
-
-st.divider()
-
-# ---------------------------------------------------
-# RANKING
-# ---------------------------------------------------
-
-st.header("🏆 Top Trending Technologies")
-
-st.divider()
-
-st.header("⚡ Trend Momentum Score")
-
-momentum = momentum_score()
-
-fig_momentum = px.bar(
-    momentum.to_pandas(),
-    x="momentum_score",
-    y="keyword",
-    orientation="h",
-    color="momentum_score",
-    color_continuous_scale="Plasma"
-)
-
-fig_momentum.update_layout(template="plotly_dark")
-
-st.plotly_chart(fig_momentum, use_container_width=True)
-fig_rank = px.bar(
-    ranking.to_pandas(),
-    x="growth",
-    y="keyword",
-    orientation="h",
-    color="growth",
-    color_continuous_scale="Turbo"
-)
-
-fig_rank.update_layout(
-    template="plotly_dark",
-    height=350,
-    margin=dict(l=0, r=0, t=30, b=0)
-)
-
-st.plotly_chart(fig_rank, use_container_width=True)
-
-st.divider()
-
-# ---------------------------------------------------
-# AI ECOSYSTEM GRAPH
-# ---------------------------------------------------
-
-st.divider()
-
-st.header("📡 AI Technology Radar")
-
-radar = momentum.head(5)
-
-fig_radar = px.line_polar(
-    radar.to_pandas(),
-    r="momentum_score",
-    theta="keyword",
-    line_close=True
-)
-
-fig_radar.update_traces(fill="toself")
-
-fig_radar.update_layout(template="plotly_dark")
-
-st.plotly_chart(fig_radar, use_container_width=True)
-
-st.header("🌐 AI Ecosystem Map")
-
-graph = build_trend_graph()
-
-net = Network(
-    height="500px",
-    width="100%",
-    bgcolor="#0E1117",
-    font_color="white"
-)
-
-for node in graph.nodes():
-    net.add_node(node, label=node, size=30)
-
-for edge in graph.edges():
-    net.add_edge(edge[0], edge[1])
-
-net.barnes_hut()
-
-html = net.generate_html()
-
-st.components.v1.html(html, height=550)
+if __name__ == "__main__":
+    host = "127.0.0.1"
+    port = 8050
+    url = f"http://{host}:{port}"
+    print(f"Dashboard disponivel em: {url}")
+    threading.Timer(1.0, lambda: webbrowser.open_new(url)).start()
+    app.run(debug=True, host=host, port=port, use_reloader=False)

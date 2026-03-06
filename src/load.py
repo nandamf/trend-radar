@@ -1,24 +1,19 @@
-import duckdb
-from extract import extract_trends
-from transform import transform_data
+import sys
+from pathlib import Path
 
-def load_to_duckdb(df):
+import polars as pl
 
-    con = duckdb.connect("data/trends.duckdb")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
-    con.execute("""
-    CREATE TABLE IF NOT EXISTS trends (
-                date TIMESTAMP,
-                keyword VARCHAR,
-                interest INTEGER)
-    """)
+from src.data_access import load_to_duckdb as _load_to_duckdb
+from src.extract import extract_trends
+from src.transform import transform_data
 
-    con.execute("""
-    INSERT INTO trends
-    SELECT * FROM df
-    """)
 
-    con.close()
+def load_to_duckdb(df: pl.DataFrame, replace: bool = False) -> None:
+    _load_to_duckdb(df, replace=replace)
 
 if __name__ == "__main__":
 
